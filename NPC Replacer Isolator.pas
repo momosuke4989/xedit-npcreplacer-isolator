@@ -36,6 +36,23 @@ uses 'xEdit_mmskCommonLibrary\xEdit_mmskCommonLibrary';
 
 interface
 
+const
+  // ----------------------------------------------------------------
+  // RunIsolatorProcess / DoProcess の戻り値コード
+  // 呼び出し元はこの値を見て「継続してよいか」「中断すべきか」を判断する。
+  // xEdit本体のProcess関数にそのまま横流ししないこと(全体停止の危険あり)。
+  // ----------------------------------------------------------------
+
+  // --- 継続グループ: 呼び出し元は次のレコードへ進んでよい ---
+  ISOLATE_SUCCESS         = 0;  // 複製成功、正常処理
+  ISOLATE_NOT_OVERRIDE    = 1;  // オーバーライドレコードではないためスキップ。
+  ISOLATE_MISSING_FACEGEN = 2;  // FaceGenファイル欠落でスキップ。バニラFaceTint使用時は正常処理
+  ISOLATE_RECORD_REMOVED  = 3;  // 複製せずに元レコードeを削除した(FaceGen欠落レコード削除オプション使用時)。
+
+  // --- 中断グループ: 呼び出し元はバッチ全体を打ち切るべき ---
+  ISOLATE_ABORT          = -1; // 致命的エラー(公式マスター誤編集/ESL上限超過/複数プラグイン選択など)
+
+
 function RunIsolatorInitialize: integer;
 function RunIsolatorProcess(const e: IInterface; var createdRecord: IInterface; callerScriptName: string): integer;
 function RunIsolatorFinalize: integer;
@@ -377,7 +394,7 @@ begin
   end;
 end;
 
-procedure DisableNPCPlacedRecord(baseNPCRecord: IwbMainRecord;);
+procedure DisableNPCPlacedRecord(baseNPCRecord: IwbMainRecord);
 var
   refRecord: IwbMainRecord;
   i: integer;
@@ -444,6 +461,38 @@ begin
     AddMessage('Failed to extract: ' + relPath);
 end;
 
+function TryUseVanillaFaceTint(const texturePath: string): boolean;
+var
+  containerName, relPath: string;
+begin
+  Result := false;
+
+  if not useVanillaFaceTint then
+    Exit;
+
+  AddMessage('  Extract Vanilla FaceTint file');
+  // バニラFaceTintを抽出しoldPathに配置
+  relPath := Copy(texturePath, Length(DataPath) + 1, Length(texturePath));
+  containerName := FindResourceContainer(relPath);
+
+  if containerName = '' then begin
+    AddMessage('  No container found for Vanilla FaceTint.');
+    Exit;
+  end
+  else begin
+    AddMessage('  Found container name: ' + containerName);
+    ExtractVanillaFaceTint(containerName, relPath, texturePath);
+  end;
+
+  // 実際に展開できたかどうかをファイルの有無で確認する
+  if FileExists(texturePath) then begin
+    Result := true;
+  end
+  else begin
+    AddMessage('  Failed to extract Vanilla FaceTint. This record will be treated as missing FaceTint.');
+  end;
+end;
+
 function DoInitialize: integer;
 var
   slOpts, slDisableOpts: TStringList;
@@ -469,13 +518,9 @@ begin
   useTraitsCount              := 0;
   removedRecordCount          := 0;
 
-  slMissingFaceGeomRecordID     := TStringList.Create;
-  slMissingFaceTintRecordID     := TStringList.Create;
-  slMissingFaceGenBothRecordID  := TStringList.Create;
-  slMissingFaceGenWithUseTraits := TStringList.Create;
-
   slOpts                := TStringList.Create;
   slDisableOpts         := TStringList.Create;
+  // グローバルのTStringListの初期化はDoInitializeプロセスが正常に終了するのが確定してから実行する
 
   checkBoxCaption             := 'Choose Isolator Process Option';
 
@@ -495,7 +540,7 @@ begin
     end
     else begin
       AddMessage('Selection was canceled.');
-      Result := -1;
+      Result := ISOLATE_ABORT;
       Exit;
     end;
 
@@ -523,9 +568,15 @@ begin
     false,
     prefix) then begin
     MessageDlg('Cancel was pressed, aborting the script.', mtInformation, [mbOK], 0);
-    Result := -1;
+    Result := ISOLATE_ABORT;
     Exit;
   end;
+
+  // グローバルのTStringListを初期化
+  slMissingFaceGeomRecordID     := TStringList.Create;
+  slMissingFaceTintRecordID     := TStringList.Create;
+  slMissingFaceGenBothRecordID  := TStringList.Create;
+  slMissingFaceGenWithUseTraits := TStringList.Create;
 
   AddMessage('Prefix set to: ' + prefix);
 end;
@@ -543,18 +594,16 @@ var
   recordID, recordFileName: string; // レコードID関連
   oldMeshPath, oldTexturePath,
   newMeshPath, newTexturePath: string; // FaceGenファイルのパス格納用
-
-  containerName, relPath: string;
   vanillaFaceTintExtracted: boolean; // バニラFaceTint展開用
 
 begin
-  Result := 0;
+  Result := ISOLATE_SUCCESS;
   // 選択中のプラグインを検証、最初のレコードのみ実行する
   if testFile = false then begin
     //  マスターファイルを編集しようとしていたら中止
     if IsOfficialMaster(GetFileName(GetFile(e))) then begin
       AddMessage(EditorID(e) + ' is a member of ' + GetFileName(e) + '! Do not Edit it!');
-      Result := -1;
+      Result := ISOLATE_ABORT;
       Exit;
     end;
 
@@ -570,7 +619,7 @@ begin
     if eslFlag then begin
       // ESLフラグがオンの場合、レコード数と振り分け可能なForm IDの上限チェックを実施
       if ESLFlagedPluginTest(replacerFile) then begin
-        Result := -1;
+        Result := ISOLATE_ABORT;
         Exit;
       end;
     end;
@@ -595,6 +644,7 @@ begin
   //AddMessage('Set compareStrRslt:' + IntToStr(compareStrRslt));
   if compareStrRslt <> 0 then begin
     AddMessage('A different plugin was found than the one the first record belongs to. Further processing will be skipped.');
+    Result := ISOLATE_ABORT;
     Exit;
   end;
 
@@ -611,12 +661,12 @@ begin
       AddMessage('  "Add Disabled flag" option is true. Searching for ACHR record refereeing the NPC...');
       DisableNPCPlacedRecord(e);
       AddMessage('  All ACHR records refereeing ' + EditorID(e) + ' are disabled. Subsequent processing will be skipped.');
-      Exit;
     end
     else begin
       AddMessage('Processing will be skipped.');
-      Exit;
     end;
+    Result := ISOLATE_NOT_OVERRIDE;
+    Exit;
   end;
 
   Inc(recordCount);
@@ -668,6 +718,7 @@ begin
       AddMessage('--------------------------------------------------------------------------------------------------------------------------------------------------');
       Inc(removedRecordCount);
       Remove(e);
+      Result := ISOLATE_RECORD_REMOVED;
       Exit;
     end;
 
@@ -682,6 +733,7 @@ begin
       AddMessage('  This record (' + recordID + ') should have FaceGen files, but none were found.');
       AddMessage('--------------------------------------------------------------------------------------------------------------------------------------------------');
       slMissingFaceGenBothRecordID.Add(CreateSLValueFromRecordIDWithName(oldEditorID, oldFormID, recordFileName, NPCName));
+      Result := ISOLATE_MISSING_FACEGEN;
       Exit;
     end;
   end
@@ -691,6 +743,7 @@ begin
     AddMessage('--------------------------------------------------------------------------------------------------------------------------------------------------');
     Inc(missingFaceGeomCount);
     slMissingFaceGeomRecordID.Add(CreateSLValueFromRecordIDWithName(oldEditorID, oldFormID, recordFileName, NPCName));
+    Result := ISOLATE_MISSING_FACEGEN;
     Exit;
   end
   else if not missingFacegeom and missingFacetint then begin
@@ -699,32 +752,15 @@ begin
     AddMessage('--------------------------------------------------------------------------------------------------------------------------------------------------');
     Inc(missingFaceTintCount);
     slMissingFaceTintRecordID.Add(CreateSLValueFromRecordIDWithName(oldEditorID, oldFormID, recordFileName, NPCName));
-    if useVanillaFaceTint then begin
-      AddMessage('  Extract Vanilla FaceTint file');
-      // バニラFaceTintを抽出しoldPathに配置
-      relPath := Copy(oldTexturePath, Length(DataPath) + 1, Length(oldTexturePath));
-      containerName := FindResourceContainer(relPath);
 
-      if containerName = '' then
-        AddMessage('  No container found for Vanilla FaceTint.')
-      else begin
-        AddMessage('  Found container name: ' + containerName);
-        ExtractVanillaFaceTint(containerName, relPath, oldTexturePath);
-      end;
-
-
-      // 実際に展開できたかどうかをファイルの有無で確認する
-      if FileExists(oldTexturePath) then begin
-        vanillaFaceTintExtracted := true;
-        missingFacetint := false;
-      end
-      else begin
-        AddMessage('  Failed to extract Vanilla FaceTint. This record will be treated as missing FaceTint.');
-        Exit; // 既存の「FaceTint欠落・展開なし」パスと同じ扱いにする
-      end;
+    if TryUseVanillaFaceTint(oldTexturePath) then begin
+      vanillaFaceTintExtracted := true;
+      missingFacetint := false;
     end
-    else
+    else begin
+      Result := ISOLATE_MISSING_FACEGEN;
       Exit;
+    end;
   end;
 
 
@@ -732,6 +768,7 @@ begin
   newRecord := wbCopyElementToFile(e, GetFile(e), True, True);
   if not Assigned(newRecord) then begin
     AddMessage('  Error: Failed to copy record for ' + Name(e));
+    Result := ISOLATE_ABORT;
     Exit;
   end;
 
@@ -795,23 +832,23 @@ end;
 
 function RunIsolatorInitialize: integer;
 begin
-  AddMessage('Isolator Process: Initialize');
+  AddMessage('---------- [Isolator] Initialize Start ----------');
   Result := DoInitialize;
-  AddMessage('Isolator Process: Initialize Completed');
+  AddMessage('---------- [Isolator] Initialize End ----------');
 end;
 
 function RunIsolatorProcess(const e: IInterface; var createdRecord: IInterface; callerScriptName: string): integer;
 begin
-  AddMessage('Isolator Process: Run Process');
+  AddMessage('---------- [Isolator] Process Start ----------');
   Result := DoProcess(e, createdRecord, callerScriptName);
-  AddMessage('Isolator Process: Run Process Completed');
+  AddMessage('---------- [Isolator] Process End ----------');
 end;
 
 function RunIsolatorFinalize: integer;
 begin
-  AddMessage('Isolator Process: Finalize');
+  AddMessage('---------- [Isolator] Finalize Start ----------');
   Result := DoFinalize;
-  AddMessage('Isolator Process: Finalize Completed');
+  AddMessage('---------- [Isolator] Finalize End ----------');
 end;
 
 
@@ -821,12 +858,20 @@ begin
 end;
 
 function Process(e: IInterface): integer;
-var convertedRecord: IInterface;
+var
+  isolatorResult: integer;
+  convertedRecord: IInterface;
 begin
+  Result := ISOLATE_SUCCESS;
   convertedRecord := nil;
-  Result := DoProcess(e, convertedRecord, CALLER_SELF);
-  if Assigned(convertedRecord) then
-    AddMessage('  Converted NPC record name:' + Name(convertedRecord));
+  isolatorResult := DoProcess(e, convertedRecord, CALLER_SELF);
+  AddMessage(' DoProcess Result:' + IntToStr(isolatorResult));
+
+  if isolatorResult = ISOLATE_ABORT then begin
+    AddMessage('  Fatal error reported by Isolator. Aborting the rest of the script.');
+    Result := ISOLATE_ABORT;
+  end;
+
 end;
 
 function Finalize: integer;
